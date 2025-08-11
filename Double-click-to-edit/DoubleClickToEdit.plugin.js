@@ -1,279 +1,181 @@
 /**
- * @name Double Click To Edit
- * @author Farcrada, original idea by Jiiks
- * @version 9.4.10
- * @description Double click a message you wrote to quickly edit it.
- * 
- * @invite qH6UWCwfTu
- * @website https://github.com/Farcrada/DiscordPlugins/
- * @source https://github.com/Farcrada/DiscordPlugins/blob/master/Double-click-to-edit/DoubleClickToEdit.plugin.js
- * @updateUrl https://raw.githubusercontent.com/Farcrada/DiscordPlugins/master/Double-click-to-edit/DoubleClickToEdit.plugin.js
+ * @name MessageClickActions
+ * @author You
+ * @version 1.0.0
+ * @description Hold Backspace + click to delete, double-click to edit/reply (BetterDiscord port).
  */
 
-/** @type {typeof import("react")} */
-const React = BdApi.React,
+const PLUGIN_NAME = "MessageClickActions";
 
-	{ Webpack, Webpack: { Filters }, Data, Utils, ReactUtils } = BdApi,
+module.exports = class MessageClickActions {
+  constructor() {
+    this.defaultSettings = {
+      enableDeleteOnClick: true,
+      enableDoubleClickToEdit: true,
+      enableDoubleClickToReply: true,
+      requireModifier: false, // require ctrl/shift for double-click actions
+    };
 
-	config = {},
+    // state
+    this.settings = BdApi.Data.load(PLUGIN_NAME, "settings") || this.defaultSettings;
+    this.isDeletePressed = false;
+    this._patched = false;
+  }
 
-	ignore = [
-		//Object
-		"video",
-		"emoji",
-		//Classes
-		"content",
-		"reactionInner"
-	],
-	walkable = [
-		"child",
-		"memoizedProps",
-		"sibling"
-	];
+  start() {
+    // Keep simple: load settings (persisted)
+    this.settings = BdApi.Data.load(PLUGIN_NAME, "settings") || this.defaultSettings;
 
+    // key listeners for Backspace hold
+    this._keydown = (e) => { if (e.key === "Backspace") this.isDeletePressed = true; };
+    this._keyup   = (e) => { if (e.key === "Backspace") this.isDeletePressed = false; };
+    document.addEventListener("keydown", this._keydown);
+    document.addEventListener("keyup", this._keyup);
 
-module.exports = class DoubleClickToEdit {
+    // find modules/stores/actions we need (best-effort with fallbacks)
+    const Webpack = BdApi.Webpack;
+    this.MessageActions = Webpack.getModule(m => m?.deleteMessage && m?.startEditMessage) || Webpack.getModule(m => m?.deleteMessage && m?.editMessage);
+    this.FluxDispatcher = Webpack.getModule(m => m?.dispatch && m?.subscribe && m?.unsubscribe) || Webpack.getModule(m => m?.dispatch && m?._dispatchToken);
+    this.ChannelStore = Webpack.getStore ? Webpack.getStore("ChannelStore") : Webpack.getModule(m => m?.getChannel && m?.getDMFromUserId);
+    this.UserStore = Webpack.getStore ? Webpack.getStore("UserStore") : Webpack.getModule(m => m?.getCurrentUser);
+    this.EditStore = Webpack.getModule(m => m?.isEditing && m?.isEditingAny) || {};
+    this.PermissionStore = Webpack.getStore ? Webpack.getStore("PermissionStore") : Webpack.getModule(m => m?.can && m?.isSomething);
+    this.PermissionsBits = Webpack.getModule(m => m?.ADMINISTRATOR && m?.SEND_MESSAGES) || {};
 
+    // find the Message React component (this can vary; try common patterns)
+    const MessageModule = Webpack.getModule(m => m?.default?.displayName === "Message" || (m?.default && m.default.displayName && m.default.displayName.includes("Message")));
 
-	constructor(meta) { config.info = meta; }
+    if (!MessageModule) {
+      console.warn(PLUGIN_NAME, "Couldn't find Message component — plugin may be incompatible with this client version.");
+      return;
+    }
 
-	start() {
-		try {
-			//Classes
-			this.selectedClass = Webpack.getModule(Filters.byKeys("message", "selected")).selected;
-			this.messagesWrapper = Webpack.getModule(Filters.byKeys("empty", "messagesWrapper")).messagesWrapper;
+    // Patch the Message component so we get the message & channel for click events.
+    // We'll clone the returned React element and inject our onClick wrapper.
+    BdApi.Patcher.after(PLUGIN_NAME, MessageModule, "default", (thisObj, args, returnValue) => {
+      try {
+        const props = args && args[0] ? args[0] : {};
+        const msg = props.message ?? (props.msg ?? null);
+        if (!msg) return returnValue; // nothing to do
 
-			//Copy to clipboard
-			this.copyToClipboard = Webpack.getModule(Filters.byKeys("clipboard", "app")).clipboard.copy;
+        // compute channel object robustly
+        const channel = (msg && msg.channel_id)
+          ? (this.ChannelStore && this.ChannelStore.getChannel ? this.ChannelStore.getChannel(msg.channel_id) : null)
+          : (props.channel ?? null);
 
-			//Reply functions
-			this.replyToMessage = Webpack.getModule(m => m?.toString?.()?.replace('\n', '')?.search(/(channel:e,message:n,shouldMention:!)/) > -1, { searchExports: true })
-			this.getChannel = Webpack.getModule(Filters.byKeys("getChannel", "getDMFromUserId")).getChannel;
+        const oldOnClick = (returnValue && returnValue.props && returnValue.props.onClick) ? returnValue.props.onClick : null;
 
-			//Stores
-			this.MessageStore = Webpack.getModule(Filters.byKeys("receiveMessage", "editMessage"));
-			this.CurrentUserStore = Webpack.getModule(Filters.byKeys("getCurrentUser"));
+        const myOnClick = (event) => {
+          try { if (typeof oldOnClick === "function") oldOnClick(event); } catch (err) { console.error(err); }
 
-			//Settings
-			this.FormSwitch = Webpack.getModule(Filters.byStrings('labelRow', 'checked'), { searchExports: true });
-			this.RadioGroup = Webpack.getModule(m => Filters.byKeys('NOT_SET', 'NONE')(m?.Sizes), { searchExports: true });
-			this.FormItem = Webpack.getModule(m => Filters.byStrings('titleId', 'errorId', 'setIsFocused')(m?.render), { searchExports: true });
+          // basic guards
+          const isMe = msg?.author?.id === (this.UserStore?.getCurrentUser?.()?.id ?? (this.UserStore?.getCurrentUser && this.UserStore.getCurrentUser().id));
+          // If backspace is NOT pressed -> handle double-click actions
+          if (!this.isDeletePressed) {
+            // need at least double click
+            if (event.detail < 2) return;
+            if (this.settings.requireModifier && !event.ctrlKey && !event.shiftKey) return;
+            if (msg.deleted === true) return;
 
-			//Events
-			global.document.addEventListener('dblclick', this.doubleclickFunc);
+            // If message is ours -> edit
+            if (isMe) {
+              if (!this.settings.enableDoubleClickToEdit) return;
+              if (this.EditStore && typeof this.EditStore.isEditing === "function" && this.EditStore.isEditing(channel?.id, msg.id)) return;
+              if (this.MessageActions && typeof this.MessageActions.startEditMessage === "function") {
+                try { this.MessageActions.startEditMessage(channel?.id ?? msg.channel_id, msg.id, msg.content); } catch(e){console.error(e);}
+                event.preventDefault();
+              }
+            } else {
+              // reply to others
+              if (!this.settings.enableDoubleClickToReply) return;
+              // skip ephemeral messages (Vencord checks a flag). best-effort:
+              const EPHEMERAL = 64;
+              if (typeof msg.hasFlag === "function" && msg.hasFlag(EPHEMERAL)) return;
 
-			//Load settings
-			//Edit
-			this.doubleClickToEditModifier = Data.load(config.info.slug, "doubleClickToEditModifier") ?? false;
-			this.editModifier = Data.load(config.info.slug, "editModifier") ?? "shift";
-			//Reply
-			this.doubleClickToReply = Data.load(config.info.slug, "doubleClickToReply") ?? false;
-			this.doubleClickToReplyModifier = Data.load(config.info.slug, "doubleClickToReplyModifier") ?? false;
-			this.replyModifier = Data.load(config.info.slug, "replyModifier") ?? "shift";
-			//Copy
-			this.doubleClickToCopy = Data.load(config.info.slug, "doubleClickToCopy") ?? false;
-			this.copyModifier = Data.load(config.info.slug, "copyModifier") ?? "shift";
+              if (this.FluxDispatcher && typeof this.FluxDispatcher.dispatch === "function") {
+                try {
+                  this.FluxDispatcher.dispatch({
+                    type: "CREATE_PENDING_REPLY",
+                    channel,
+                    message: msg,
+                    shouldMention: true,
+                    showMentionToggle: channel?.guild_id != null
+                  });
+                } catch (err) { console.error(err); }
+              }
+            }
+          } else {
+            // Backspace is held => delete behavior
+            if (!this.settings.enableDeleteOnClick) return;
+            // only allow delete if it's our message OR we have manage messages permission
+            const isAllowedToDelete = isMe || (this.PermissionStore && typeof this.PermissionStore.can === "function" && this.PermissionStore.can(this.PermissionsBits?.MANAGE_MESSAGES ?? "MANAGE_MESSAGES", channel));
+            if (!isAllowedToDelete) return;
 
-		}
-		catch (err) {
-			try {
-				console.error("Attempting to stop after starting error...", err);
-				this.stop();
-			}
-			catch (err) {
-				console.error(config.info.name + ".stop()", err);
-			}
-		}
-	}
+            if (msg.deleted) {
+              // if already deleted, dispatch message-delete event (best-effort)
+              if (this.FluxDispatcher && typeof this.FluxDispatcher.dispatch === "function") {
+                try {
+                  this.FluxDispatcher.dispatch({ type: "MESSAGE_DELETE", channelId: channel?.id ?? msg.channel_id, id: msg.id, mlDeleted: true });
+                } catch (err) { console.error(err); }
+              }
+            } else {
+              if (this.MessageActions && typeof this.MessageActions.deleteMessage === "function") {
+                try { this.MessageActions.deleteMessage(channel?.id ?? msg.channel_id, msg.id); } catch(e){console.error(e);}
+              }
+            }
+            event.preventDefault();
+          }
+        };
 
-	//By doing this we make sure we're able to remove our event
-	//otherwise it gets stuck on the page and never actually unloads.
-	doubleclickFunc = (e) => this.handler(e);
+        // clone the returned tree and add our onClick (merge with existing props)
+        const React = BdApi.React;
+        return React.cloneElement(returnValue, Object.assign({}, returnValue.props, { onClick: myOnClick }));
+      } catch (err) {
+        console.error(PLUGIN_NAME, "patch error", err);
+        return returnValue;
+      }
+    });
 
-	stop = () => document.removeEventListener('dblclick', this.doubleclickFunc);
+    this._patched = true;
+    console.log(PLUGIN_NAME, "started");
+  }
 
-	getSettingsPanel() {
-		//Anonymous function to preserve the this scope,
-		//which also makes it an anonymous functional component;
-		//Pretty neat.
-		return () => {
-			//Edit
-			const [editEnableModifier, setEditEnableModifier] = React.useState(this.doubleClickToEditModifier),
-				[editModifier, setEditModifier] = React.useState(this.editModifier),
-				//Reply
-				[reply, setReply] = React.useState(this.doubleClickToReply),
-				[replyEnableModifier, setReplyEnableModifier] = React.useState(this.doubleClickToReplyModifier),
-				[replyModifier, setReplyModifier] = React.useState(this.replyModifier),
-				//Copy
-				[copy, setCopy] = React.useState(this.doubleClickToCopy),
-				[copyModifier, setCopyModifier] = React.useState(this.copyModifier);
+  stop() {
+    // remove listeners and patches
+    document.removeEventListener("keydown", this._keydown);
+    document.removeEventListener("keyup", this._keyup);
+    BdApi.Patcher.unpatchAll(PLUGIN_NAME);
+    this._patched = false;
+    console.log(PLUGIN_NAME, "stopped");
+  }
 
-			return [
-				//Edit
-				React.createElement(this.FormSwitch, {
-					//The state that is loaded with the default value
-					value: editEnableModifier,
-					note: "Enable modifier for double clicking to edit",
-					//Since onChange passes the current state we can simply invoke it as such
-					onChange: (newState) => {
-						//Saving the new state
-						this.doubleClickToEditModifier = newState;
-						Data.save(config.info.slug, "doubleClickToEditModifier", newState);
-						setEditEnableModifier(newState);
-					}
-					//Discord Is One Of Those
-				}, "Enable Edit Modifier"),
-				React.createElement(this.FormItem, {
-					disabled: !editEnableModifier,
-					title: "Modifer to hold to edit a message"
-				},
-					React.createElement(this.RadioGroup, {
-						disabled: !editEnableModifier,
-						value: editModifier,
-						options: [
-							{ name: "Shift", value: "shift" },
-							{ name: "Ctrl", value: "ctrl" },
-							{ name: "Alt", value: "alt" }
-						],
-						onChange: (newState) => {
-							this.editModifier = newState.value;
-							Data.save(config.info.slug, "editModifier", newState.value);
-							setEditModifier(newState.value);
-						}
-					})),
+  getSettingsPanel() {
+    const panel = document.createElement("div");
+    panel.style.padding = "8px";
 
-				//Reply
-				React.createElement(this.FormSwitch, {
-					value: reply,
-					note: "Double click another's message and start replying.",
-					onChange: (newState) => {
-						this.doubleClickToReply = newState;
-						Data.save(config.info.slug, "doubleClickToReply", newState);
-						setReply(newState);
-					}
-				}, "Enable Replying"),
-				React.createElement(this.FormSwitch, {
-					disabled: !reply,
-					value: replyEnableModifier,
-					note: "Enable modifier for double clicking to reply",
-					onChange: (newState) => {
-						this.doubleClickToReplyModifier = newState;
-						Data.save(config.info.slug, "doubleClickToReplyModifier", newState);
-						setReplyEnableModifier(newState);
-					}
-				}, "Enable Reply Modifier"),
-				React.createElement(this.FormItem, {
-					disabled: (!reply || !replyEnableModifier),
-					title: "Modifier to hold when replying to a message"
-				},
-					React.createElement(this.RadioGroup, {
-						disabled: (!reply || !replyEnableModifier),
-						value: replyModifier,
-						options: [
-							{ name: "Shift", value: "shift" },
-							{ name: "Ctrl", value: "ctrl" },
-							{ name: "Alt", value: "alt" }
-						],
-						onChange: (newState) => {
-							this.replyModifier = newState.value;
-							Data.save(config.info.slug, "replyModifier", newState.value);
-							setReplyModifier(newState.value);
-						}
-					})),
+    const makeCheckbox = (label, key) => {
+      const line = document.createElement("div");
+      line.style.marginBottom = "8px";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = this.settings[key];
+      cb.onchange = () => {
+        this.settings[key] = cb.checked;
+        BdApi.Data.save(PLUGIN_NAME, "settings", this.settings);
+      };
+      const lbl = document.createElement("label");
+      lbl.style.marginLeft = "8px";
+      lbl.textContent = label;
+      line.appendChild(cb);
+      line.appendChild(lbl);
+      return line;
+    };
 
-				//Copy
-				React.createElement(this.FormSwitch, {
-					value: copy,
-					note: "Copy selection before entering edit-mode.",
-					onChange: (newState) => {
-						this.doubleClickToCopy = newState;
-						Data.save(config.info.slug, "doubleClickToCopy", newState);
-						setCopy(newState);
-					}
-				}, "Enable Copying"),
-				React.createElement(this.FormItem, {
-					disabled: !copy,
-					title: "Modifier to hold before copying text"
-				},
-					React.createElement(this.RadioGroup, {
-						disabled: !copy,
-						value: copyModifier,
-						options: [
-							{ name: "Shift", value: "shift" },
-							{ name: "Ctrl", value: "ctrl" },
-							{ name: "Alt", value: "alt" }
-						],
-						onChange: (newState) => {
-							this.copyModifier = newState.value;
-							Data.save(config.info.slug, "copyModifier", newState.value);
-							setCopyModifier(newState.value);
-						}
-					}))
-			];
-		}
-	}
+    panel.appendChild(makeCheckbox("Enable delete on click (hold Backspace + click)", "enableDeleteOnClick"));
+    panel.appendChild(makeCheckbox("Double-click to edit (your messages)", "enableDoubleClickToEdit"));
+    panel.appendChild(makeCheckbox("Double-click to reply (others' messages)", "enableDoubleClickToReply"));
+    panel.appendChild(makeCheckbox("Require Ctrl/Shift key for double-click actions", "requireModifier"));
 
-	handler(e) {
-		//Check if we're not double clicking
-		if (typeof (e?.target?.className) !== typeof ("") ||
-			ignore.some(nameOfClass => e?.target?.className?.indexOf?.(nameOfClass) > -1))
-			return;
-
-		//Target the message
-		const messageDiv = e.target.closest('li > [class^=message]');
-
-		//If it finds nothing, null it.
-		if (!messageDiv)
-			return;
-		//Make sure we're not resetting when the message is already in edit-mode.
-		if (messageDiv.classList.contains(this.selectedClass))
-			return;
-
-		//Basically make a HTMLElement/Node interactable with it's React components.
-		const instance = ReactUtils.getInternalInstance(messageDiv);
-		//Mandatory nullcheck
-		if (!instance)
-			return;
-
-		//When selecting text it might be useful to copy.
-		const copyKeyHeld = this.checkForModifier(this.doubleClickToCopy, this.copyModifier, e);
-		if (copyKeyHeld)
-			this.copyToClipboard(document.getSelection().toString());
-
-		//The message instance is filled top to bottom, as it is in view.
-		//As a result, "baseMessage" will be the actual message you want to address. And "message" will be the reply.
-		//Maybe the message has a reply, so check if "baseMessage" exists and otherwise fallback on "message".
-		const message = Utils.findInTree(instance, m => m?.baseMessage, { walkable: walkable })?.baseMessage ??
-			Utils.findInTree(instance, m => m?.message, { walkable: walkable })?.message;
-
-		if (!message)
-			return;
-
-		//Now we do the same thing with the edit and reply modifier
-		const editKeyHeld = this.checkForModifier(this.doubleClickToEditModifier, this.editModifier, e),
-			replyKeyHeld = this.checkForModifier(this.doubleClickToReplyModifier, this.replyModifier, e);
-
-		//If a modifier is enabled, check if the key is held, otherwise ignore.
-		if ((this.doubleClickToEditModifier ? editKeyHeld : true) && message.author.id === this.CurrentUserStore.getCurrentUser().id)
-			this.MessageStore.startEditMessage(message.channel_id, message.id, message.content);
-		else if ((this.doubleClickToReplyModifier ? replyKeyHeld : true) && this.doubleClickToReply)
-			this.replyToMessage(this.getChannel(message.channel_id), message, e);
-	}
-
-	/**
-	 * 
-	 * @param {boolean} enabled Is the modifier enabled
-	 * @param {string} modifier Modifier key to be checked for
-	 * @param {Event} event The event checked against
-	 * @returns {boolean} Whether the modifier is enabled and the modifier is pressed
-	 */
-	checkForModifier(enabled, modifier, event) {
-		if (enabled)
-			switch (modifier) {
-				case "shift": return event.shiftKey;
-				case "ctrl": return event.ctrlKey;
-				case "alt": return event.altKey;
-			}
-		return false;
-	}
-}
+    return panel;
+  }
+};
